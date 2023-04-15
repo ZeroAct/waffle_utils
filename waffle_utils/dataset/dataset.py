@@ -1,22 +1,58 @@
 import logging
-import os
 import random
 import warnings
+from collections import OrderedDict
+from dataclasses import asdict, dataclass
 from functools import cached_property
 from pathlib import Path
 from typing import Union
 
+from waffle_utils.dataset import (
+    Annotation,
+    Category,
+    DataType,
+    Image,
+    TaskType,
+)
+from waffle_utils.dataset.adapter import export_yolo
 from waffle_utils.file import io
 from waffle_utils.utils import type_validator
-
-from .fields import Annotation, Category, Image
-from .format import Format
 
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class DatasetInfo:
+    name: str
+    task: str
+    created: str = None
+
+    def __post_init__(self):
+        self.created = self.created or io.get_current_time()
+
+    def to_dict(self):
+        return asdict(self)
+
+    def to_json(self):
+        return io.to_json(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        return cls(**d)
+
+    @classmethod
+    def from_json(cls, json: str):
+        return cls.from_dict(io.load_json(json))
+
+    @classmethod
+    def from_yaml(cls, yaml: str):
+        return cls.from_dict(io.load_yaml(yaml))
+
+
 class Dataset:
     DEFAULT_DATASET_ROOT_DIR = Path("./datasets")
+    DATASET_INFO_FILE_NAME = Path("info.yaml")
+
     RAW_IMAGE_DIR = Path("raw")
     IMAGE_DIR = Path("images")
     ANNOTATION_DIR = Path("annotations")
@@ -33,9 +69,11 @@ class Dataset:
     def __init__(
         self,
         name: str,
+        task: str,
         root_dir: str = None,
     ):
         self.name = name
+        self.task = task
         self.root_dir = (
             Path(root_dir) if root_dir else Dataset.DEFAULT_DATASET_ROOT_DIR
         )
@@ -51,6 +89,20 @@ class Dataset:
         self.__name = v
 
     @property
+    def task(self):
+        return self.__task
+
+    @task.setter
+    @type_validator(str)
+    def task(self, v):
+        if v not in TaskType:
+            raise ValueError(
+                f"Invalid task type: {v}"
+                f"Available task types: {list(TaskType)}"
+            )
+        self.__task = v.upper()
+
+    @property
     def root_dir(self):
         return self.__root_dir
 
@@ -63,6 +115,10 @@ class Dataset:
     @cached_property
     def dataset_dir(self) -> Path:
         return self.root_dir / self.name
+
+    @cached_property
+    def dataset_info_file(self) -> Path:
+        return self.dataset_dir / Dataset.DATASET_INFO_FILE_NAME
 
     @cached_property
     def raw_image_dir(self) -> Path:
@@ -109,19 +165,79 @@ class Dataset:
         return self.set_dir / Dataset.UNLABELED_SET_FILE_NAME
 
     @cached_property
-    def categories(self) -> list[str]:
-        categories: list[Category] = self.get_categories()
+    def images(self) -> dict[int, Image]:
+        return OrderedDict(
+            {
+                image.image_id: image
+                for image in sorted(
+                    self.get_images(), key=lambda i: i.image_id
+                )
+            }
+        )
+
+    @cached_property
+    def unlabeled_images(self) -> dict[int, Image]:
+        return OrderedDict(
+            {
+                image.image_id: image
+                for image in sorted(
+                    self.get_images(labeled=False), key=lambda i: i.image_id
+                )
+            }
+        )
+
+    @cached_property
+    def annotations(self) -> dict[int, Annotation]:
+        return OrderedDict(
+            {
+                annotation.annotation_id: annotation
+                for annotation in sorted(
+                    self.get_annotations(), key=lambda a: a.annotation_id
+                )
+            }
+        )
+
+    @cached_property
+    def categories(self) -> dict[int, Category]:
+        return OrderedDict(
+            {
+                category.category_id: category
+                for category in sorted(
+                    self.get_categories(), key=lambda c: c.category_id
+                )
+            }
+        )
+
+    @cached_property
+    def category_names(self) -> list[str]:
+        categories: dict[int, Category] = self.categories
         return [
-            c.name for c in sorted(categories, key=lambda c: c.category_id)
+            c.name
+            for c in sorted(categories.values(), key=lambda c: c.category_id)
         ]
+
+    @cached_property
+    def image_to_annotations(self) -> dict[int, list[Annotation]]:
+        return OrderedDict(
+            {
+                image_id: list(
+                    filter(
+                        lambda a: a.image_id == image_id,
+                        self.annotations.values(),
+                    )
+                )
+                for image_id in self.images.keys()
+            }
+        )
 
     # factories
     @classmethod
-    def new(cls, name: str, root_dir: str = None) -> "Dataset":
+    def new(cls, name: str, task: str, root_dir: str = None) -> "Dataset":
         """Create New Dataset
 
         Args:
             name (str): Dataset name
+            task (str): Dataset task
             root_dir (str, optional): Dataset root directory. Defaults to None.
 
         Raises:
@@ -130,7 +246,7 @@ class Dataset:
         Returns:
             Dataset: Dataset Class
         """
-        ds = cls(name, root_dir)
+        ds = cls(name, task, root_dir)
         if ds.initialized():
             raise FileExistsError(
                 f'{ds.dataset_dir} already exists. try another name or Dataset.load("{name}")'
@@ -163,21 +279,19 @@ class Dataset:
         Returns:
             Dataset: Dataset Class
         """
-        src_ds = cls(src_name, src_root_dir)
+        src_ds = Dataset.load(src_name, src_root_dir)
         if not src_ds.initialized():
             raise FileNotFoundError(
                 f"{src_ds.dataset_dir} has not been created by Waffle."
             )
 
-        ds = cls(name, root_dir)
-        if ds.initialized():
-            raise FileExistsError(
-                f"{ds.dataset_dir} already exists. try another name."
-            )
+        ds = Dataset.new(name, src_ds.task, root_dir)
         ds.initialize()
         io.copy_files_to_directory(
             src_ds.dataset_dir, ds.dataset_dir, create_directory=True
         )
+
+        return ds
 
     @classmethod
     def load(cls, name: str, root_dir: str = None) -> "Dataset":
@@ -193,17 +307,21 @@ class Dataset:
         Returns:
             Dataset: Dataset Class
         """
-        ds = cls(name, root_dir)
-        if not ds.initialized():
+        dataset_info_file = (
+            Path(root_dir) / name / Dataset.DATASET_INFO_FILE_NAME
+        )
+        if not dataset_info_file.exists():
             raise FileNotFoundError(
-                f'{ds.dataset_dir} has not been created. Run Dataset.new("{name}") first.'
+                f"{dataset_info_file} has not been created."
             )
-        return ds
+        dataset_info = DatasetInfo.from_yaml(dataset_info_file)
+        return cls(**dataset_info.to_dict(), root_dir=root_dir)
 
     @classmethod
     def from_coco(
         cls,
         name: str,
+        task: str,
         coco_file: str,
         coco_root_dir: str,
         root_dir: str = None,
@@ -212,6 +330,7 @@ class Dataset:
 
         Args:
             name (str): Dataset name.
+            task (str): Dataset task.
             coco_file (str): Coco json file path.
             coco_root_dir (str): Coco image root directory.
             root_dir (str, optional): Dataset root directory. Defaults to None.
@@ -222,11 +341,7 @@ class Dataset:
         Returns:
             Dataset: Dataset Class
         """
-        ds = cls(name, root_dir)
-        if ds.initialized():
-            raise FileExistsError(
-                f"{ds.dataset_dir} already exists. try another name."
-            )
+        ds = Dataset.new(name, task, root_dir)
         ds.initialize()
 
         # parse coco annotation file
@@ -241,7 +356,8 @@ class Dataset:
             ds.add_annotations(
                 [
                     Annotation.from_dict(
-                        {**annotation_dict, "annotation_id": annotation_id}
+                        {**annotation_dict, "annotation_id": annotation_id},
+                        task,
                     )
                 ]
             )
@@ -250,7 +366,7 @@ class Dataset:
             ds.add_categories(
                 [
                     Category.from_dict(
-                        {**category_dict, "category_id": category_id}
+                        {**category_dict, "category_id": category_id}, task
                     )
                 ]
             )
@@ -269,6 +385,16 @@ class Dataset:
         io.make_directory(self.annotation_dir)
         io.make_directory(self.category_dir)
 
+        # create dataset_info.yaml
+        io.save_yaml(
+            DatasetInfo(
+                name=self.name,
+                task=self.task,
+                categories=self.get_categories(),
+            ).to_dict(),
+            self.dataset_info_file,
+        )
+
     def initialized(self) -> bool:
         """Check if Dataset has been initialized or not.
 
@@ -277,12 +403,7 @@ class Dataset:
                 initialized -> True
                 not initialized -> False
         """
-        return (
-            self.raw_image_dir.exists()
-            and self.image_dir.exists()
-            and self.annotation_dir.exists()
-            and self.category_dir.exists()
-        )
+        return self.dataset_info_file.exists()
 
     # get
     def get_images(
@@ -327,7 +448,7 @@ class Dataset:
             list[Category]: "Category" list
         """
         return [
-            Category.from_json(f)
+            Category.from_json(f, self.task)
             for f in (
                 [
                     self.category_dir / f"{category_id}.json"
@@ -349,12 +470,12 @@ class Dataset:
         """
         if image_id:
             return [
-                Annotation.from_json(f)
+                Annotation.from_json(f, self.task)
                 for f in self.annotation_dir.glob(f"{image_id}/*.json")
             ]
         else:
             return [
-                Annotation.from_json(f)
+                Annotation.from_json(f, self.task)
                 for f in self.annotation_dir.glob("*/*.json")
             ]
 
@@ -369,12 +490,12 @@ class Dataset:
         """
         if image_id:
             return [
-                Annotation.from_json(f)
+                Annotation.from_json(f, self.task)
                 for f in self.prediction_dir.glob(f"{image_id}/*.json")
             ]
         else:
             return [
-                Annotation.from_json(f)
+                Annotation.from_json(f, self.task)
                 for f in self.prediction_dir.glob("*/*.json")
             ]
 
@@ -497,297 +618,47 @@ class Dataset:
         )
 
     # export
-    def export(self, export_format: Union[str, Format]) -> str:
-        f"""Export Dataset to Specific data formats
-
-        Args:
-            export_format (Union[str, Format]): export format. one of {list(map(lambda x: x.name, Format))}.
+    def get_split_ids(self) -> list[list[int]]:
+        """Get split ids
 
         Returns:
-            str: exported dataset directory
+            list[list[int]]: split ids
         """
-
-        # get split ids
-        if not self.train_set_file.exists() or not self.val_set_file.exists():
+        if not self.train_set_file.exists():
             raise FileNotFoundError(
                 "There is no set files. Please run ds.split() first"
             )
 
-        train_image_ids: list = io.load_json(self.train_set_file)
-        val_image_ids: list = io.load_json(self.val_set_file)
-        test_image_ids: list = io.load_json(self.test_set_file)
-        unlabeled_image_ids: list = io.load_json(self.unlabeled_set_file)
+        train_ids: list[int] = io.load_json(self.train_set_file)
+        val_ids: list[int] = io.load_json(self.val_set_file)
+        test_ids: list[int] = io.load_json(self.test_set_file)
+        unlabeled_ids: list[int] = io.load_json(self.unlabeled_set_file)
 
-        if isinstance(export_format, str):
-            export_format = export_format.upper()
-            format_names = list(map(lambda x: x.name, Format))
-            if export_format not in format_names:
-                raise ValueError(
-                    f"{export_format} is not supported. Use one of {format_names}"
-                )
-            export_format = Format[export_format]
+        return [train_ids, val_ids, test_ids, unlabeled_ids]
 
-        export_dir: Path = self.export_dir / export_format.name
+    def export(self, data_type: Union[str, DataType]) -> str:
+        """Export Dataset to Specific data formats
+
+        Args:
+            data_type (Union[str, DataType]): export data type. one of ["YOLO", "COCO"].
+
+        Returns:
+            str: exported dataset directory
+        """
+        export_dir: Path = self.export_dir / str(data_type)
         if export_dir.exists():
             io.remove_directory(export_dir)
             warnings.warn(
                 f"{export_dir} already exists. Removing exist export and override."
             )
-        io.make_directory(export_dir)
 
-        if export_format == Format.YOLO_DETECTION:
-            f"""YOLO DETECTION FORMAT
-            - directory format
-                yolo_dataset/
-                    train/
-                        images/
-                            1.png
-                        labels/
-                            1.txt
-                            ```
-                            class x_center y_center width height
-                            ```
-                    val/
-                        images/
-                            2.png
-                        labels/
-                            2.txt
-                    test/
-                        images/
-                            3.png
-                        labels/
-                            3.txt
-
-            - dataset.yaml
-                path: [dataset_dir]/exports/{export_format.name}
-                train: train
-                val: val
-                names:
-                    0: person
-                    1: bicycle
-                    ...
-            """
-
-            def _export(images: list[Image], export_dir: Path):
-                image_dir = export_dir / "images"
-                label_dir = export_dir / "labels"
-
-                io.make_directory(image_dir)
-                io.make_directory(label_dir)
-
-                for image in images:
-                    image_path = self.raw_image_dir / image.file_name
-                    image_dst_path = image_dir / image.file_name
-                    label_dst_path = (label_dir / image.file_name).with_suffix(
-                        ".txt"
-                    )
-                    io.copy_file(
-                        image_path, image_dst_path, create_directory=True
-                    )
-
-                    W = image.width
-                    H = image.height
-
-                    annotations: list[Annotation] = self.get_annotations(
-                        image.image_id
-                    )
-                    label_txts = []
-                    for annotation in annotations:
-                        x1, y1, w, h = annotation.bbox
-                        x1, w = x1 / W, w / W
-                        y1, h = y1 / H, h / H
-                        cx, cy = x1 + w / 2, y1 + h / 2
-
-                        category_id = annotation.category_id - 1
-
-                        label_txts.append(f"{category_id} {cx} {cy} {w} {h}")
-
-                    io.make_directory(label_dst_path.parent)
-                    with open(label_dst_path, "w") as f:
-                        f.write("\n".join(label_txts))
-
-            if train_image_ids:
-                io.make_directory(export_dir / "train")
-                _export(self.get_images(train_image_ids), export_dir / "train")
-            if val_image_ids:
-                io.make_directory(export_dir / "val")
-                _export(self.get_images(val_image_ids), export_dir / "val")
-            if test_image_ids:
-                io.make_directory(export_dir / "test")
-                _export(self.get_images(test_image_ids), export_dir / "test")
-
-            io.save_yaml(
-                {
-                    "path": str(export_dir.absolute()),
-                    "train": "train",
-                    "val": "val",
-                    "test": "test",
-                    "names": {
-                        category.category_id - 1: category.name
-                        for category in self.get_categories()
-                    },
-                },
-                export_dir / "data.yaml",
-            )
-
-            return str(export_dir)
-
-        elif export_format == Format.YOLO_CLASSIFICATION:
-            f"""YOLO CLASSIFICATION FORMAT (compatiable with torchvision.datasets.ImageFolder)
-            - directory format
-                yolo_dataset/
-                    train/
-                        person/
-                            1.png
-                        bicycle/
-                            2.png
-                    val/
-                        person/
-                            3.png
-                        bicycle/
-                            4.png
-                    test/
-                        person/
-                            5.png
-                        bicycle/
-                            6.png
-            - dataset.yaml
-                path: [dataset_dir]/exports/{export_format.name}
-                train: train
-                val: val
-                test: test
-                names:
-                    0: person
-                    1: bicycle
-                    ...
-            """
-
-            def _export(
-                images: list[Image],
-                categories: list[Category],
-                export_dir: Path,
-            ):
-                image_dir = export_dir
-                cat_dict: dict = {
-                    cat.category_id: cat.name for cat in categories
-                }
-
-                for image in images:
-                    image_path = self.raw_image_dir / image.file_name
-
-                    annotations: list[Annotation] = self.get_annotations(
-                        image.image_id
-                    )
-                    if len(annotations) > 1:
-                        warnings.warn(
-                            f"Multi label does not support yet. Skipping {image_path}."
-                        )
-                        continue
-                    category_id = annotations[0].category_id
-
-                    image_dst_path = (
-                        image_dir / cat_dict[category_id] / image.file_name
-                    )
-                    io.copy_file(
-                        image_path, image_dst_path, create_directory=True
-                    )
-
-            if train_image_ids:
-                io.make_directory(export_dir / "train")
-                _export(
-                    self.get_images(train_image_ids),
-                    self.get_categories(),
-                    export_dir / "train",
-                )
-            if val_image_ids:
-                io.make_directory(export_dir / "val")
-                _export(
-                    self.get_images(val_image_ids),
-                    self.get_categories(),
-                    export_dir / "val",
-                )
-            if test_image_ids:
-                io.make_directory(export_dir / "test")
-                _export(
-                    self.get_images(test_image_ids),
-                    self.get_categories(),
-                    export_dir / "test",
-                )
-
-            io.save_yaml(
-                {
-                    "path": str(export_dir.absolute()),
-                    "train": "train",
-                    "val": "val",
-                    "test": "test",
-                    "names": {
-                        category.category_id - 1: category.name
-                        for category in self.get_categories()
-                    },
-                },
-                export_dir / "data.yaml",
-            )
-
-            return str(export_dir)
-
-        elif export_format == Format.YOLO_SEGMENTATION:
-            raise NotImplementedError
-
-        elif export_format == Format.COCO_DETECTION:
-            """COCO DETECTION FORMAT
-            - directory format
-                coco_dataset/
-                    images/
-                        1.png
-                        ...
-                    train.json
-                    val.json
-                    test.json
-            """
-
-            def _export(images: list[Image], set_name: str, export_dir: Path):
-                image_dir = export_dir / "images"
-                label_path = export_dir / f"{set_name}.json"
-
-                io.make_directory(image_dir)
-
-                coco = {"categories": [], "images": [], "annotations": []}
-
-                for category in self.get_categories():
-                    d = category.to_dict()
-                    category_id = d.pop("category_id")
-                    coco["categories"].append({"id": category_id, **d})
-
-                for image in images:
-                    image_path = self.raw_image_dir / image.file_name
-                    image_dst_path = image_dir / image.file_name
-                    io.copy_file(
-                        image_path, image_dst_path, create_directory=True
-                    )
-
-                    d = image.to_dict()
-                    image_id = d.pop("image_id")
-                    coco["images"].append({"id": image_id, **d})
-
-                    annotations = self.get_annotations(image_id)
-                    for annotation in annotations:
-                        d = annotation.to_dict()
-                        annotation_id = d.pop("annotation_id")
-                        coco["annotations"].append({"id": annotation_id, **d})
-
-                io.save_json(coco, label_path, create_directory=True)
-
-            if train_image_ids:
-                _export(self.get_images(train_image_ids), "train", export_dir)
-            if val_image_ids:
-                _export(self.get_images(val_image_ids), "val", export_dir)
-            if test_image_ids:
-                _export(self.get_images(test_image_ids), "test", export_dir)
-            if unlabeled_image_ids:
-                _export(
-                    self.get_images(unlabeled_image_ids, labeled=False),
-                    "unlabeled",
-                    export_dir,
-                )
-
-            return str(export_dir)
+        try:
+            if data_type == DataType.YOLO:
+                export_yolo(self, export_dir)
+            # elif data_type == DataType.COCO:
+            #     export_coco(self, export_dir)
+            else:
+                raise ValueError(f"Invalid data_type: {data_type}")
+        except Exception as e:
+            io.remove_directory(export_dir)
+            raise e

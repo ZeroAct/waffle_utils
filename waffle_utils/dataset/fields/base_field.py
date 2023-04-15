@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 
+from waffle_utils.dataset.format import TaskType
 from waffle_utils.file import io
+
 
 class BaseField(ABC):
     def __init__(self):
@@ -16,12 +18,41 @@ class BaseField(ABC):
         pass
 
     @classmethod
-    def from_dict(cls, d: dict):
-        """Create Field Instance from dictionary"""
-        return cls(**d)
+    def from_dict(cls, d: dict, task: str = None) -> "BaseField":
+        """Load Field from dict.
+
+        Args:
+            d (dict): annotation dict.
+            task (str, optional): task name. Default to None.
+
+        Returns:
+            Field Object: Field Object.
+        """
+        if task == TaskType.CLASSIFICATION:
+            return cls.classification(**d)
+        elif task == TaskType.OBJECT_DETECTION:
+            return cls.object_detection(**d)
+        elif task == TaskType.SEGMENTATION:
+            return cls.segmentation(**d)
+        elif task == TaskType.KEYPOINT_DETECTION:
+            return cls.keypoint_detection(**d)
+        elif task == TaskType.TEXT_RECOGNITION:
+            return cls.text_recognition(**d)
+        elif task == TaskType.REGRESSION:
+            return cls.regression(**d)
+        else:
+            return cls.new(**d)
 
     @classmethod
-    def from_json(cls, f: str):
-        """Create Field Instance from json file"""
+    def from_json(cls, f: str, task: str = None) -> "BaseField":
+        """Load Field from json file.
+
+        Args:
+            f (str): json file path.
+            task (str, optional): task name. Default to None.
+
+        Returns:
+            Field Object: Field Object.
+        """
         d: dict = io.load_json(f)
-        return cls.from_dict(d)
+        return cls.from_dict(d, task)
